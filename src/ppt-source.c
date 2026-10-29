@@ -655,7 +655,7 @@ static uint32_t ppt_height(void *data)
 struct obs_source_info powerpoint_source_info = {
 	.id = "powerpoint_slides",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_SRGB,
 	.get_name = ppt_get_name,
 	.create = ppt_create,
 	.destroy = ppt_destroy,
