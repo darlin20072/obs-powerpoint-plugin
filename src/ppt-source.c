@@ -130,8 +130,10 @@ static bool run_hidden(const char *cmdline)
 #endif
 }
 
-static bool convert_presentation(const char *file, const char *dir, int width, int height)
+static bool convert_presentation(const char *file, const char *dir, int width, int height, char **err_msg)
 {
+	if (err_msg)
+		*err_msg = NULL;
 	struct dstr script = {0};
 	struct dstr cmd = {0};
 	bool ok = false;
@@ -146,13 +148,20 @@ static bool convert_presentation(const char *file, const char *dir, int width, i
 		"try {\r\n"
 		"  $In = [System.IO.Path]::GetFullPath($In)\r\n"
 		"  $Out = [System.IO.Path]::GetFullPath($Out)\r\n"
+		"  if (-not (Test-Path 'Registry::HKEY_CLASSES_ROOT\\PowerPoint.Application')) {\r\n"
+		"    throw 'Microsoft PowerPoint (version de escritorio) no esta instalado en este equipo.'\r\n"
+		"  }\r\n"
+		"  $copy = Join-Path $Out ('source' + [System.IO.Path]::GetExtension($In))\r\n"
+		"  Copy-Item -LiteralPath $In -Destination $copy -Force\r\n"
+		"  Unblock-File -LiteralPath $copy\r\n"
 		"  $app = New-Object -ComObject PowerPoint.Application\r\n"
-		"  $pres = $app.Presentations.Open($In, -1, 0, 0)\r\n"
+		"  try { $pres = $app.Presentations.Open($copy, -1, 0, 0) }\r\n"
+		"  catch { $pres = $app.Presentations.Open($copy, -1, 0, -1) }\r\n"
 		"  $pres.Export($Out, 'PNG', $W, $H)\r\n"
 		"  $pres.Close()\r\n"
 		"} catch {\r\n"
 		"  $err = Join-Path ([System.IO.Path]::GetFullPath($Out)) 'error.txt'\r\n"
-		"  ($_ | Out-String) | Out-File -LiteralPath $err -Encoding utf8\r\n"
+		"  ($_.Exception.Message) | Out-File -LiteralPath $err -Encoding utf8\r\n"
 		"  exit 1\r\n"
 		"} finally {\r\n"
 		"  if ($app -ne $null -and $app.Presentations.Count -eq 0) { $app.Quit() }\r\n"
@@ -186,7 +195,10 @@ static bool convert_presentation(const char *file, const char *dir, int width, i
 		char *msg = os_quick_read_utf8_file(ep.array);
 		blog(LOG_WARNING, "[powerpoint] la conversión falló: %s",
 		     msg ? msg : "(sin detalles; revisa que PowerPoint esté instalado)");
-		bfree(msg);
+		if (err_msg)
+			*err_msg = msg;
+		else
+			bfree(msg);
 		dstr_free(&ep);
 	}
 	dstr_free(&script);
@@ -286,7 +298,8 @@ static void *convert_thread(void *param)
 		set_status_locked(s, "Convirtiendo presentación…");
 		pthread_mutex_unlock(&s->mutex);
 
-		bool ok = file && dir && convert_presentation(file, dir, w, h);
+		char *err = NULL;
+		bool ok = file && dir && convert_presentation(file, dir, w, h, &err);
 		char **list = NULL;
 		size_t n = 0;
 		if (ok)
@@ -302,6 +315,7 @@ static void *convert_thread(void *param)
 			/* Cambiaron los ajustes mientras convertía: repetir. */
 			pthread_mutex_unlock(&s->mutex);
 			free_slide_list(list, n);
+			bfree(err);
 			continue;
 		}
 
@@ -311,8 +325,13 @@ static void *convert_thread(void *param)
 		s->slide_count = n;
 		s->list_dirty = true;
 
-		if (!ok)
-			set_status_locked(s, "Error al convertir. Revisa el registro de OBS (Ayuda > Archivos de registro) y busca [powerpoint].");
+		if (!ok) {
+			struct dstr msg = {0};
+			dstr_printf(&msg, "Error al convertir: %s",
+				    err ? err : "sin detalles (revisa el registro de OBS y busca [powerpoint])");
+			set_status_locked(s, msg.array);
+			dstr_free(&msg);
+		}
 		else if (n == 0)
 			set_status_locked(s, "No se generaron diapositivas.");
 		else {
@@ -322,6 +341,7 @@ static void *convert_thread(void *param)
 			dstr_free(&msg);
 		}
 
+		bfree(err);
 		s->running = false;
 		pthread_mutex_unlock(&s->mutex);
 		break;
@@ -347,6 +367,7 @@ static void request_convert_locked(struct ppt_source *s)
 
 	s->running = true;
 	s->restart = false;
+	set_status_locked(s, "Convirtiendo presentación…");
 	s->thread_valid = pthread_create(&s->thread, NULL, convert_thread, s) == 0;
 	if (!s->thread_valid)
 		s->running = false;
@@ -493,14 +514,33 @@ static bool btn_next(obs_properties_t *props, obs_property_t *prop, void *data)
 	return true;
 }
 
+static void refresh_info(struct ppt_source *s, obs_properties_t *props)
+{
+	obs_property_t *info = obs_properties_get(props, "info");
+	if (!info)
+		return;
+	pthread_mutex_lock(&s->mutex);
+	obs_property_set_description(info, s->status ? s->status : "");
+	pthread_mutex_unlock(&s->mutex);
+}
+
 static bool btn_reload(obs_properties_t *props, obs_property_t *prop, void *data)
 {
-	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(prop);
 	struct ppt_source *s = data;
 	pthread_mutex_lock(&s->mutex);
+	if (s->file && *s->file && !s->running)
+		set_status_locked(s, "Convirtiendo presentación…");
 	request_convert_locked(s);
 	pthread_mutex_unlock(&s->mutex);
+	refresh_info(s, props);
+	return true;
+}
+
+static bool btn_status(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	UNUSED_PARAMETER(prop);
+	refresh_info(data, props);
 	return true;
 }
 
@@ -511,12 +551,6 @@ static obs_properties_t *ppt_properties(void *data)
 
 	obs_properties_add_path(props, "file", "Presentación", OBS_PATH_FILE,
 				"Presentaciones (*.pptx *.ppt *.pptm *.odp);;Todos los archivos (*.*)", NULL);
-	obs_properties_add_int(props, "width", "Ancho de render (px)", 320, 7680, 1);
-	obs_properties_add_int(props, "height", "Alto de render (px)", 240, 4320, 1);
-	obs_properties_add_int(props, "slide", "Diapositiva", 1, 9999, 1);
-	obs_properties_add_button(props, "prev", "◀ Anterior", btn_prev);
-	obs_properties_add_button(props, "next", "Siguiente ▶", btn_next);
-	obs_properties_add_button(props, "reload", "Recargar presentación", btn_reload);
 
 	obs_property_t *info = obs_properties_add_text(props, "info", "Estado", OBS_TEXT_INFO);
 	if (s) {
@@ -524,6 +558,15 @@ static obs_properties_t *ppt_properties(void *data)
 		obs_property_set_description(info, s->status ? s->status : "");
 		pthread_mutex_unlock(&s->mutex);
 	}
+	obs_properties_add_button(props, "status", "Actualizar estado", btn_status);
+
+	obs_properties_add_int(props, "slide", "Diapositiva", 1, 9999, 1);
+	obs_properties_add_button(props, "prev", "◀ Anterior", btn_prev);
+	obs_properties_add_button(props, "next", "Siguiente ▶", btn_next);
+	obs_properties_add_button(props, "reload", "Recargar presentación", btn_reload);
+
+	obs_properties_add_int(props, "width", "Ancho de render (px)", 320, 7680, 1);
+	obs_properties_add_int(props, "height", "Alto de render (px)", 240, 4320, 1);
 	return props;
 }
 
