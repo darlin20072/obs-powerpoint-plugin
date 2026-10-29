@@ -36,4 +36,9 @@ endif()
 
    target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/ppt-source.c)
 
+      if(OS_WINDOWS)
+     find_package(w32-pthreads REQUIRED)
+     target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::w32-pthreads)
+   endif()
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
